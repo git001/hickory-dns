@@ -11,6 +11,7 @@ use std::{
 use async_recursion::async_recursion;
 use futures_util::{StreamExt, stream};
 use lru_cache::LruCache;
+use moka::sync::Cache as MokaCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
@@ -46,7 +47,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     roots: NameServerPool<P>,
-    name_server_cache: Arc<Mutex<LruCache<Name, NameServerPool<P>>>>,
+    name_server_cache: MokaCache<Name, NameServerPool<P>>,
     local_root_delegations: Arc<HashMap<Name, RootZoneDelegation>>,
     response_cache: ResponseCache,
     #[cfg(feature = "metrics")]
@@ -155,7 +156,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         let roots =
             NameServerPool::from_config(servers, pool_context.clone(), conn_provider.clone());
 
-        let name_server_cache = Arc::new(Mutex::new(LruCache::new(ns_cache_size)));
+        let name_server_cache = MokaCache::new(ns_cache_size as u64);
         let response_cache = ResponseCache::new(response_cache_size, cache_policy.clone());
 
         // DnsRequestOptions to use with outbound requests made by the recursor.
@@ -543,12 +544,12 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         for i in 1..=num_labels {
             let zone = query_name.trim_to(i as usize);
-            if let Some(ns) = self.name_server_cache.lock().get_mut(&zone) {
+            if let Some(ns) = self.name_server_cache.get(&zone) {
                 match ns.ttl_expired() {
                     true => debug!(?zone, "cached name server pool expired"),
                     false => {
                         debug!(?zone, "already have cached name server pool for zone");
-                        nameserver_pool = ns.clone();
+                        nameserver_pool = ns;
                         continue;
                     }
                 }
@@ -594,7 +595,6 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
                         debug!(?zone, "using local root-zone delegation");
                         self.name_server_cache
-                            .lock()
                             .insert(zone.clone(), nameserver_pool.clone());
                         continue;
                     }
@@ -750,7 +750,6 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             // store in cache for future usage
             debug!(?zone, "found nameservers for {zone}");
             self.name_server_cache
-                .lock()
                 .insert(zone.clone(), nameserver_pool.clone());
         }
 
@@ -758,7 +757,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         {
             self.metrics
                 .name_server_cache_size
-                .set(self.name_server_cache.lock().len() as f64);
+                .set(self.name_server_cache.entry_count() as f64);
             self.metrics
                 .connection_cache_size
                 .set(self.connection_cache.lock().len() as f64);
