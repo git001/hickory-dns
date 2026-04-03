@@ -10,6 +10,8 @@ use std::{
 use test_support::{MockNetworkHandler, MockProvider, MockRecord, MockResponseSection, subscribe};
 use tokio::time as TokioTime;
 
+#[cfg(feature = "serde")]
+use super::{DnssecPolicyConfig, RecursiveConfig};
 use super::{Recursor, RecursorError, RecursorMode, RecursorOptions, is_subzone};
 use crate::{
     cache::TtlConfig,
@@ -56,6 +58,81 @@ async fn recursor_connection_deduplication() -> Result<(), NetError> {
         );
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
+#[tokio::test]
+async fn signed_root_zone_bootstrap_avoids_root_queries() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    subscribe();
+
+    let query_name = Name::from_ascii("host.hickory-dns.testing.")?;
+    let leaf_zone = Name::from_ascii("hickory-dns.testing.")?;
+    let leaf_ns = Name::from_ascii("ns.hickory-dns.testing.")?;
+    let root_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53));
+
+    let responses = vec![
+        MockRecord::ns(TLD_IP, &leaf_zone, &leaf_ns),
+        MockRecord::a(TLD_IP, &leaf_ns, LEAF_IP)
+            .with_query_name(&leaf_zone)
+            .with_query_type(RecordType::NS)
+            .with_section(MockResponseSection::Additional),
+        MockRecord::a(LEAF_IP, &query_name, LEAF_IP),
+    ];
+    let provider = MockProvider::new(MockNetworkHandler::new(responses));
+
+    let root_zone = format!(
+        ". 86400 IN RRSIG SOA\n\
+         . 518400 IN NS a.root-servers.net.\n\
+         a.root-servers.net. 3600000 IN A {root_ip}\n\
+         testing. 172800 IN NS testing.testing.\n\
+         testing.testing. 172800 IN A {tld_ip}\n",
+        tld_ip = TLD_IP,
+    );
+
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let roots_file = std::env::temp_dir().join(format!(
+        "hickory_signed_root_{pid}_{unique}.zone",
+        pid = std::process::id()
+    ));
+    fs::write(&roots_file, root_zone)?;
+
+    let config = RecursiveConfig {
+        roots: roots_file.clone(),
+        dnssec_policy: DnssecPolicyConfig::default(),
+        options: RecursorOptions {
+            deny_server: Vec::new(),
+            ..RecursorOptions::default()
+        },
+    };
+
+    let recursor = Recursor::from_config(config, None, provider.clone())?;
+    let response = recursor
+        .resolve(
+            Query::query(query_name.clone(), RecordType::A),
+            Instant::now(),
+            false,
+        )
+        .await?;
+
+    assert_eq!(response.response_code(), ResponseCode::NoError);
+    assert!(
+        response
+            .answers()
+            .iter()
+            .any(|answer| answer.record_type() == RecordType::A && answer.name() == &query_name)
+    );
+
+    // The TLD delegation is sourced from the local root zone file.
+    assert_eq!(provider.queries(&root_ip).len(), 0);
+
+    fs::remove_file(roots_file).ok();
     Ok(())
 }
 
@@ -922,18 +999,35 @@ mod metrics {
 ))]
 mod config {
     use std::path::Path;
+    use std::time::Duration;
 
     use crate::{
         config::{OpportunisticEncryption, OpportunisticEncryptionConfig},
-        recursor::{DnssecPolicyConfig, RecursiveConfig},
+        recursor::{DnssecPolicyConfig, RecursiveConfig, TlsVerification, TransportEncryptionMode},
     };
 
     #[test]
     fn can_parse_recursive_config() {
         let input = r#"roots = "/etc/root.hints"
-dnssec_policy.ValidateWithStaticKey.path = "/etc/trusted-key.key""#;
+dnssec_policy.ValidateWithStaticKey.path = "/etc/trusted-key.key"
+num_concurrent_reqs = 3
+prefer_tls = true
+insecure = true
+tls_ca = "/etc/pki/dns/ca.pem"
+tls_ca_directory = "/etc/pki/dns/ca.d""#;
 
         let config = toml::from_str::<RecursiveConfig>(input).unwrap();
+        assert_eq!(config.options.num_concurrent_reqs, 3);
+        assert!(config.options.prefer_tls);
+        assert!(config.options.insecure);
+        assert_eq!(
+            config.options.tls_ca.as_deref(),
+            Some(Path::new("/etc/pki/dns/ca.pem"))
+        );
+        assert_eq!(
+            config.options.tls_ca_directory.as_deref(),
+            Some(Path::new("/etc/pki/dns/ca.d"))
+        );
 
         if let DnssecPolicyConfig::ValidateWithStaticKey { path, .. } = config.dnssec_policy {
             assert_eq!(Some(Path::new("/etc/trusted-key.key")), path.as_deref());
@@ -991,6 +1085,80 @@ enabled = {}
                 config: OpportunisticEncryptionConfig::default()
             }
         );
+    }
+
+    #[test]
+    fn can_parse_recursor_transport_encryption_policy() {
+        let input = r#"roots = "/etc/root.hints"
+[transport_encryption]
+mode = "opportunistic"
+
+[transport_encryption.tls]
+verification = "custom_ca"
+ca_file = "/etc/pki/dns/ca.pem"
+ca_directory = "/etc/pki/dns/ca.d"
+
+[transport_encryption.opportunistic]
+persistence_period = 3600
+damping_period = 120
+max_concurrent_probes = 7
+persistence = { path = "/var/lib/hickory/opp.toml", save_interval = 30 }
+"#;
+
+        let config = toml::from_str::<RecursiveConfig>(input).unwrap();
+        assert_eq!(
+            config.options.transport_encryption.mode,
+            TransportEncryptionMode::Opportunistic
+        );
+        assert_eq!(
+            config.options.transport_encryption.tls.verification,
+            TlsVerification::CustomCa
+        );
+        assert_eq!(
+            config.options.transport_encryption.tls.ca_file.as_deref(),
+            Some(Path::new("/etc/pki/dns/ca.pem"))
+        );
+        assert_eq!(
+            config
+                .options
+                .transport_encryption
+                .tls
+                .ca_directory
+                .as_deref(),
+            Some(Path::new("/etc/pki/dns/ca.d"))
+        );
+        assert_eq!(
+            config
+                .options
+                .transport_encryption
+                .opportunistic
+                .persistence_period,
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            config
+                .options
+                .transport_encryption
+                .opportunistic
+                .damping_period,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            config
+                .options
+                .transport_encryption
+                .opportunistic
+                .max_concurrent_probes,
+            7
+        );
+        let persistence = config
+            .options
+            .transport_encryption
+            .opportunistic
+            .persistence
+            .expect("persistence must be set");
+        assert_eq!(persistence.path, Path::new("/var/lib/hickory/opp.toml"));
+        assert_eq!(persistence.save_interval, Duration::from_secs(30));
     }
 }
 
