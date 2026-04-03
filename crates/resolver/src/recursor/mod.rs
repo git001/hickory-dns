@@ -8,16 +8,13 @@
 //! A recursive DNS resolver based on the Hickory DNS (stub) resolver
 
 #[cfg(feature = "serde")]
+use std::{borrow::Cow, fs, path::Path};
 use std::{
-    borrow::Cow,
-    fs,
-    path::{Path, PathBuf},
-};
-use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
     sync::{Arc, atomic::AtomicU8},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use ipnet::IpNet;
@@ -31,12 +28,12 @@ use crate::metrics::recursor::RecursorMetrics;
 use crate::net::runtime::TokioRuntimeProvider;
 #[cfg(feature = "serde")]
 use crate::proto::{
-    rr::{RData, RecordSet},
+    rr::{RData, RecordSet, RrKey},
     serialize::txt::{ParseError, Parser},
 };
 use crate::{
     ConnectionProvider, NameServerTransportState, PoolContext, TlsConfig, TtlConfig,
-    config::OpportunisticEncryption,
+    config::{OpportunisticEncryption, OpportunisticEncryptionConfig},
     proto::{
         op::{DEFAULT_MAX_PAYLOAD_LEN, Message, Query},
         rr::Name,
@@ -71,6 +68,17 @@ mod tests;
 /// This is the well known root nodes, referred to as hints in RFCs. See the IANA [Root Servers](https://www.iana.org/domains/root/servers) list.
 pub struct Recursor<P: ConnectionProvider> {
     pub(super) mode: RecursorMode<P>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct RootZoneDelegations {
+    pub(super) zones: HashMap<Name, RootZoneDelegation>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RootZoneDelegation {
+    pub(super) ips: Arc<[IpAddr]>,
+    pub(super) ttl: u32,
 }
 
 #[cfg(feature = "tokio")]
@@ -109,23 +117,23 @@ impl<P: ConnectionProvider> Recursor<P> {
             )
         })?;
         let (_zone, roots_zone) =
-            Parser::new(roots_str, Some(path.into_owned()), Some(Name::root()))
-                .parse()
+            parse_roots_zone(roots_str, path.into_owned(), config.roots.as_path())
                 .map_err(|e| format!("failed to read roots {}: {e}", config.roots.display()))?;
 
-        let root_addrs = roots_zone
-            .values()
-            .flat_map(RecordSet::records_without_rrsigs)
-            .map(|r| &r.data)
-            .filter_map(RData::ip_addr) // we only want IPs
-            .collect::<Vec<_>>();
+        let (root_addrs, delegations) = extract_root_hints_and_delegations(&roots_zone);
+        if root_addrs.is_empty() {
+            return Err(RecursorError::from(
+                "no root name server addresses found in roots file",
+            ));
+        }
 
-        Self::new(
+        Self::new_with_delegations(
             &root_addrs,
             dnssec_policy,
             encrypted_transport_state,
             config.options.clone(),
             conn_provider,
+            delegations,
         )
     }
 
@@ -146,8 +154,51 @@ impl<P: ConnectionProvider> Recursor<P> {
         options: RecursorOptions,
         conn_provider: P,
     ) -> Result<Self, RecursorError> {
+        Self::new_with_delegations(
+            roots,
+            dnssec_policy,
+            encrypted_transport_state,
+            options,
+            conn_provider,
+            RootZoneDelegations::default(),
+        )
+    }
+
+    fn new_with_delegations(
+        roots: &[IpAddr],
+        dnssec_policy: DnssecPolicy,
+        encrypted_transport_state: Option<NameServerTransportState>,
+        mut options: RecursorOptions,
+        conn_provider: P,
+        root_zone_delegations: RootZoneDelegations,
+    ) -> Result<Self, RecursorError> {
+        let has_new_transport_config = options.has_new_transport_encryption_config();
+        let has_legacy_transport_config = options.has_legacy_transport_encryption_config();
+        let effective_transport = options.effective_transport_encryption();
+
+        if has_new_transport_config && has_legacy_transport_config {
+            warn!(
+                "legacy transport encryption options are ignored because transport_encryption is configured"
+            );
+        }
+
+        options.prefer_tls = effective_transport.prefer_tls;
+        options.prefer_tls_min_depth = effective_transport.prefer_tls_min_depth;
+        options.opportunistic_encryption = effective_transport.opportunistic_encryption;
+        options.insecure = effective_transport.insecure;
+        options.tls_ca = effective_transport.tls_ca;
+        options.tls_ca_directory = effective_transport.tls_ca_directory;
+
         let mut tls_config = TlsConfig::new()?;
-        if options.opportunistic_encryption.is_enabled() {
+        tls_config.configure_ca(
+            options.tls_ca.as_deref(),
+            options.tls_ca_directory.as_deref(),
+        )?;
+
+        if options.insecure {
+            warn!("disabling TLS peer verification by configuration (insecure=true)");
+            tls_config.insecure_skip_verify();
+        } else if options.opportunistic_encryption.is_enabled() {
             warn!("disabling TLS peer verification for opportunistic encryption mode");
             tls_config.insecure_skip_verify();
         }
@@ -163,6 +214,7 @@ impl<P: ConnectionProvider> Recursor<P> {
             options,
             tls_config,
             conn_provider,
+            root_zone_delegations,
         )?;
 
         Ok(Self {
@@ -387,6 +439,181 @@ impl<P: ConnectionProvider> Recursor<P> {
         // matching on `NonValidating` to avoid conditional compilation (`#[cfg]`)
         !matches!(self.mode, RecursorMode::NonValidating { .. })
     }
+}
+
+#[cfg(feature = "serde")]
+fn parse_roots_zone(
+    roots_str: String,
+    path: PathBuf,
+    roots_path: &Path,
+) -> Result<(Name, std::collections::BTreeMap<RrKey, RecordSet>), ParseError> {
+    let parsed = Parser::new(roots_str.clone(), Some(path.clone()), Some(Name::root())).parse();
+    match parsed {
+        Ok(parsed) => Ok(parsed),
+        Err(e) if e.to_string().contains("should be dynamically generated") => {
+            let filtered = filter_unsupported_roots_records(&roots_str);
+            Parser::new(filtered, Some(path), Some(Name::root()))
+                .parse()
+                .map_err(|err| {
+                    ParseError::from(format!(
+                        "failed to parse signed roots file {} after filtering unsupported RR types: {err}",
+                        roots_path.display()
+                    ))
+                })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(feature = "serde")]
+fn filter_unsupported_roots_records(input: &str) -> String {
+    const SUPPORTED_TYPES: [&str; 3] = ["NS", "A", "AAAA"];
+
+    let mut filtered = String::with_capacity(input.len());
+    for line in input.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with('$') {
+            filtered.push_str(line);
+            filtered.push('\n');
+            continue;
+        }
+
+        let rrtype = guess_record_type(line);
+        if rrtype
+            .map(|rrtype| SUPPORTED_TYPES.contains(&rrtype))
+            .unwrap_or(false)
+        {
+            filtered.push_str(line);
+            filtered.push('\n');
+        }
+    }
+
+    filtered
+}
+
+#[cfg(feature = "serde")]
+fn guess_record_type(line: &str) -> Option<&str> {
+    let without_comment = line.split(';').next()?.trim();
+    if without_comment.is_empty() {
+        return None;
+    }
+
+    let tokens = without_comment.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // If the line starts with whitespace the owner name is inherited from the
+    // previous record, otherwise the first token is the explicit owner name.
+    let mut idx = if line.starts_with(char::is_whitespace) {
+        0
+    } else {
+        1
+    };
+    while idx < tokens.len() {
+        if is_ttl_token(tokens[idx]) || is_dns_class_token(tokens[idx]) {
+            idx += 1;
+            continue;
+        }
+        return Some(tokens[idx]);
+    }
+
+    None
+}
+
+#[cfg(feature = "serde")]
+fn is_ttl_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit())
+}
+
+#[cfg(feature = "serde")]
+fn is_dns_class_token(token: &str) -> bool {
+    matches!(token.to_ascii_uppercase().as_str(), "IN" | "CH" | "HS")
+}
+
+#[cfg(feature = "serde")]
+fn extract_root_hints_and_delegations(
+    roots_zone: &std::collections::BTreeMap<RrKey, RecordSet>,
+) -> (Vec<IpAddr>, RootZoneDelegations) {
+    let mut ips_by_name: HashMap<Name, Vec<IpAddr>> = HashMap::new();
+    let mut root_ns_names = Vec::new();
+    let mut delegations: HashMap<Name, (Vec<Name>, u32)> = HashMap::new();
+
+    for record in roots_zone
+        .values()
+        .flat_map(RecordSet::records_without_rrsigs)
+    {
+        match record.data() {
+            RData::A(ip) => {
+                let entry = ips_by_name.entry(record.name().clone()).or_default();
+                let ip = IpAddr::from(ip.0);
+                if !entry.contains(&ip) {
+                    entry.push(ip);
+                }
+            }
+            RData::AAAA(ip) => {
+                let entry = ips_by_name.entry(record.name().clone()).or_default();
+                let ip = IpAddr::from(ip.0);
+                if !entry.contains(&ip) {
+                    entry.push(ip);
+                }
+            }
+            RData::NS(ns) if record.name().is_root() => {
+                if !root_ns_names.contains(&ns.0) {
+                    root_ns_names.push(ns.0.clone());
+                }
+            }
+            RData::NS(ns) => {
+                let entry = delegations
+                    .entry(record.name().clone())
+                    .or_insert_with(|| (Vec::new(), u32::MAX));
+                if !entry.0.contains(&ns.0) {
+                    entry.0.push(ns.0.clone());
+                }
+                entry.1 = entry.1.min(record.ttl());
+            }
+            _ => {}
+        }
+    }
+
+    let mut root_addrs = Vec::new();
+    for ns_name in root_ns_names {
+        if let Some(ips) = ips_by_name.get(&ns_name) {
+            for ip in ips {
+                if !root_addrs.contains(ip) {
+                    root_addrs.push(*ip);
+                }
+            }
+        }
+    }
+
+    let mut zones = HashMap::new();
+    for (zone, (ns_names, ttl)) in delegations {
+        let mut ips = Vec::new();
+        for ns_name in ns_names {
+            if let Some(ns_ips) = ips_by_name.get(&ns_name) {
+                for ip in ns_ips {
+                    if !ips.contains(ip) {
+                        ips.push(*ip);
+                    }
+                }
+            }
+        }
+
+        if ips.is_empty() {
+            continue;
+        }
+
+        zones.insert(
+            zone,
+            RootZoneDelegation {
+                ips: Arc::<[IpAddr]>::from(ips),
+                ttl,
+            },
+        );
+    }
+
+    (root_addrs, RootZoneDelegations { zones })
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -625,7 +852,86 @@ pub struct RecursorOptions {
     #[cfg_attr(feature = "serde", serde(default))]
     pub case_randomization: bool,
 
+    /// Number of upstream nameservers to query in parallel.
+    ///
+    /// Values below `1` are treated as `1`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default = "recursor_num_concurrent_reqs_default")
+    )]
+    pub num_concurrent_reqs: usize,
+
+    /// Timeout for upstream DNS connections. Defaults to 5 seconds.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "crate::config::duration_opt")
+    )]
+    pub connection_timeout: Option<Duration>,
+
+    /// When `prefer_tls` is set, start a fallback plaintext connection after this delay if the
+    /// TLS connection has not yet succeeded (Happy Eyeballs / RFC 8305).
+    /// Defaults to 250 ms. Set to `None` to disable Happy Eyeballs.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default = "recursor_happy_eyeballs_delay_default",
+            with = "crate::config::duration_opt"
+        )
+    )]
+    pub happy_eyeballs_delay: Option<Duration>,
+
+    /// Unified upstream transport encryption policy.
+    ///
+    /// This controls whether the recursor uses plaintext transports only, tries TLS first, or
+    /// uses opportunistic encryption probing.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub transport_encryption: TransportEncryptionOptions,
+
+    /// Prefer DNS-over-TLS for upstream nameservers and fall back to plaintext if TLS connection
+    /// establishment fails.
+    ///
+    /// Deprecated in favor of `transport_encryption.mode = "prefer_tls"`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub prefer_tls: bool,
+
+    /// Minimum DNS hierarchy depth at which `prefer_tls` is applied.
+    ///
+    /// See `transport_encryption.prefer_tls_min_depth` for details.
+    ///
+    /// Deprecated in favor of `transport_encryption.prefer_tls_min_depth`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub prefer_tls_min_depth: Option<u8>,
+
+    /// Disable TLS peer certificate verification for upstream DNS-over-TLS queries.
+    ///
+    /// This is insecure and should only be used for testing or controlled environments.
+    ///
+    /// Deprecated in favor of `transport_encryption.tls.verification = "insecure"`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub insecure: bool,
+
+    /// Optional path to a PEM file with additional CA/root certificates for DNS-over-TLS
+    /// validation.
+    ///
+    /// The configured certificates are added to the default root set.
+    ///
+    /// Deprecated in favor of `transport_encryption.tls.ca_file`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tls_ca: Option<PathBuf>,
+
+    /// Optional path to a directory containing PEM files with additional CA/root certificates for
+    /// DNS-over-TLS validation.
+    ///
+    /// The configured certificates are added to the default root set.
+    ///
+    /// Deprecated in favor of `transport_encryption.tls.ca_directory`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tls_ca_directory: Option<PathBuf>,
+
     /// Configure RFC 9539 opportunistic encryption.
+    ///
+    /// Deprecated in favor of `transport_encryption.mode = "opportunistic"` and
+    /// `transport_encryption.opportunistic`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub opportunistic_encryption: OpportunisticEncryption,
 
@@ -650,10 +956,154 @@ impl Default for RecursorOptions {
             avoid_local_udp_ports: HashSet::new(),
             cache_policy: TtlConfig::default(),
             case_randomization: false,
+            num_concurrent_reqs: 1,
+            connection_timeout: None,
+            happy_eyeballs_delay: recursor_happy_eyeballs_delay_default(),
+            transport_encryption: TransportEncryptionOptions::default(),
+            prefer_tls: false,
+            prefer_tls_min_depth: None,
+            insecure: false,
+            tls_ca: None,
+            tls_ca_directory: None,
             opportunistic_encryption: OpportunisticEncryption::default(),
             edns_payload_len: default_edns_payload_len(),
         }
     }
+}
+
+#[derive(Clone, Eq, PartialEq, Debug)]
+struct EffectiveTransportEncryption {
+    prefer_tls: bool,
+    prefer_tls_min_depth: Option<u8>,
+    opportunistic_encryption: OpportunisticEncryption,
+    insecure: bool,
+    tls_ca: Option<PathBuf>,
+    tls_ca_directory: Option<PathBuf>,
+}
+
+impl RecursorOptions {
+    fn has_new_transport_encryption_config(&self) -> bool {
+        self.transport_encryption != TransportEncryptionOptions::default()
+    }
+
+    fn has_legacy_transport_encryption_config(&self) -> bool {
+        self.prefer_tls
+            || self.insecure
+            || self.tls_ca.is_some()
+            || self.tls_ca_directory.is_some()
+            || self.opportunistic_encryption != OpportunisticEncryption::default()
+    }
+
+    fn effective_transport_encryption(&self) -> EffectiveTransportEncryption {
+        if self.has_new_transport_encryption_config() {
+            return EffectiveTransportEncryption::from_transport_encryption(
+                &self.transport_encryption,
+            );
+        }
+
+        EffectiveTransportEncryption {
+            prefer_tls: self.prefer_tls,
+            prefer_tls_min_depth: self.prefer_tls_min_depth,
+            opportunistic_encryption: self.opportunistic_encryption.clone(),
+            insecure: self.insecure,
+            tls_ca: self.tls_ca.clone(),
+            tls_ca_directory: self.tls_ca_directory.clone(),
+        }
+    }
+}
+
+impl EffectiveTransportEncryption {
+    fn from_transport_encryption(config: &TransportEncryptionOptions) -> Self {
+        let opportunistic_encryption = match config.mode {
+            TransportEncryptionMode::Opportunistic => {
+                #[cfg(any(feature = "__tls", feature = "__quic"))]
+                {
+                    OpportunisticEncryption::Enabled {
+                        config: config.opportunistic.clone(),
+                    }
+                }
+                #[cfg(not(any(feature = "__tls", feature = "__quic")))]
+                {
+                    OpportunisticEncryption::Disabled
+                }
+            }
+            _ => OpportunisticEncryption::Disabled,
+        };
+
+        Self {
+            prefer_tls: matches!(config.mode, TransportEncryptionMode::PreferTls),
+            prefer_tls_min_depth: config.prefer_tls_min_depth,
+            opportunistic_encryption,
+            insecure: matches!(config.tls.verification, TlsVerification::Insecure),
+            tls_ca: config.tls.ca_file.clone(),
+            tls_ca_directory: config.tls.ca_directory.clone(),
+        }
+    }
+}
+
+/// Upstream transport encryption settings for recursive resolution.
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[derive(Clone, Eq, PartialEq, Debug, Default)]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct TransportEncryptionOptions {
+    /// Transport encryption mode.
+    pub mode: TransportEncryptionMode,
+    /// TLS verification and custom CA settings.
+    pub tls: TransportEncryptionTlsOptions,
+    /// Opportunistic encryption probing settings.
+    pub opportunistic: OpportunisticEncryptionConfig,
+    /// Minimum DNS hierarchy depth at which `prefer_tls` is applied.
+    ///
+    /// The depth is the number of labels in the zone name (e.g. `.` = 0, `com.` = 1,
+    /// `example.com.` = 2). When set, TLS is preferred only for nameservers at or below
+    /// this depth. This allows using plain UDP/TCP for root and TLD nameservers, which
+    /// rarely support TLS, while still preferring TLS for authoritative servers deeper
+    /// in the hierarchy.
+    ///
+    /// Default: `None` (prefer TLS at all depths when `mode = "prefer_tls"`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub prefer_tls_min_depth: Option<u8>,
+}
+
+/// Supported transport encryption modes for recursive resolution.
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Default)]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum TransportEncryptionMode {
+    /// Use plaintext transports only.
+    #[default]
+    Disabled,
+    /// Prefer DNS-over-TLS and fall back to plaintext when TLS fails.
+    PreferTls,
+    /// Use RFC 9539 opportunistic encryption probing.
+    Opportunistic,
+}
+
+/// TLS-specific configuration for upstream recursive transport.
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[derive(Clone, Eq, PartialEq, Debug, Default)]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct TransportEncryptionTlsOptions {
+    /// TLS verification policy.
+    pub verification: TlsVerification,
+    /// Optional path to a PEM file with additional CA/root certificates.
+    pub ca_file: Option<PathBuf>,
+    /// Optional path to a directory of PEM files with additional CA/root certificates.
+    pub ca_directory: Option<PathBuf>,
+}
+
+/// TLS certificate verification policy for upstream recursive transport.
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Default)]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum TlsVerification {
+    /// Verify with the default system/webpki trust roots.
+    #[default]
+    System,
+    /// Verify using custom CAs configured in `ca_file`/`ca_directory`.
+    CustomCa,
+    /// Disable certificate verification (insecure).
+    Insecure,
 }
 
 #[cfg(feature = "serde")]
@@ -674,6 +1124,15 @@ fn recursion_limit_default() -> u8 {
 #[cfg(feature = "serde")]
 fn ns_recursion_limit_default() -> u8 {
     24
+}
+
+fn recursor_happy_eyeballs_delay_default() -> Option<Duration> {
+    Some(Duration::from_millis(250))
+}
+
+#[cfg(feature = "serde")]
+fn recursor_num_concurrent_reqs_default() -> usize {
+    1
 }
 
 #[cfg(feature = "serde")]
