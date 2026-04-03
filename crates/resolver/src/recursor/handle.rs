@@ -10,9 +10,7 @@ use std::{
 
 use async_recursion::async_recursion;
 use futures_util::{StreamExt, stream};
-use lru_cache::LruCache;
 use moka::sync::Cache as MokaCache;
-use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
 use super::{
@@ -58,8 +56,8 @@ pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     name_server_filter: AccessControlSet,
     pool_context: Arc<PoolContext>,
     conn_provider: P,
-    connection_cache: Arc<Mutex<LruCache<IpAddr, Arc<NameServer<P>>>>>,
-    transient_ns_error_cache: Arc<Mutex<LruCache<Query, Instant>>>,
+    connection_cache: MokaCache<IpAddr, Arc<NameServer<P>>>,
+    transient_ns_error_cache: MokaCache<Query, Instant>,
     request_options: DnsRequestOptions,
     ttl_config: TtlConfig,
 }
@@ -184,8 +182,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 .build()?,
             pool_context,
             conn_provider,
-            connection_cache: Arc::new(Mutex::new(LruCache::new(ns_cache_size))),
-            transient_ns_error_cache: Arc::new(Mutex::new(LruCache::new(ns_cache_size))),
+            connection_cache: MokaCache::new(ns_cache_size as u64),
+            transient_ns_error_cache: MokaCache::new(ns_cache_size as u64),
             request_options,
             ttl_config: cache_policy.clone(),
         })
@@ -760,7 +758,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 .set(self.name_server_cache.entry_count() as f64);
             self.metrics
                 .connection_cache_size
-                .set(self.connection_cache.lock().len() as f64);
+                .set(self.connection_cache.entry_count() as f64);
         }
 
         Ok((depth, nameserver_pool))
@@ -971,11 +969,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 
     fn transient_ns_error_cached(&self, query: &Query, now: Instant) -> bool {
-        let mut cache = self.transient_ns_error_cache.lock();
-        match cache.get_mut(query) {
-            Some(valid_until) if *valid_until > now => true,
+        match self.transient_ns_error_cache.get(query) {
+            Some(valid_until) if valid_until > now => true,
             Some(_) => {
-                cache.remove(query);
+                self.transient_ns_error_cache.invalidate(query);
                 false
             }
             None => false,
@@ -983,7 +980,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 
     fn clear_transient_ns_error(&self, query: &Query) {
-        self.transient_ns_error_cache.lock().remove(query);
+        self.transient_ns_error_cache.invalidate(query);
     }
 
     fn cache_transient_ns_error(&self, query: Query, now: Instant) {
@@ -993,9 +990,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             .into_inner();
         let ttl = negative_min_ttl.max(Duration::from_secs(1));
 
-        self.transient_ns_error_cache
-            .lock()
-            .insert(query, now + ttl);
+        self.transient_ns_error_cache.insert(query, now + ttl);
     }
 
     fn is_transient_recursor_error(error: &RecursorError) -> bool {
@@ -1017,12 +1012,11 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         &self,
         config_group: &[NameServerConfig],
     ) -> Vec<Arc<NameServer<P>>> {
-        let mut cache = self.connection_cache.lock();
         config_group
             .iter()
             .map(|server| {
-                if let Some(ns) = cache.get_mut(&server.ip) {
-                    return ns.clone();
+                if let Some(ns) = self.connection_cache.get(&server.ip) {
+                    return ns;
                 }
 
                 debug!(?server, "adding new name server to cache");
@@ -1032,7 +1026,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     &self.pool_context.clone().options,
                     self.conn_provider.clone(),
                 ));
-                cache.insert(server.ip, ns.clone());
+                self.connection_cache.insert(server.ip, ns.clone());
                 ns
             })
             .collect()
