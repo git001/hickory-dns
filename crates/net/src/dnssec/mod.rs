@@ -317,8 +317,16 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                     return Ok(message);
                 }
 
-                // Return Ok if the zone is insecure
-                if let Err(err) = self.find_ds_records(query.name().clone(), options).await {
+                // Return Ok if the zone is insecure.
+                //
+                // For DS queries, check the parent name to avoid self-recursion while trying to
+                // prove insecurity of the same delegation point.
+                let insecure_check_name = if query.query_type() == RecordType::DS {
+                    query.name().base_name()
+                } else {
+                    query.name().clone()
+                };
+                if let Err(err) = self.find_ds_records(insecure_check_name, options).await {
                     if err.proof == Proof::Insecure {
                         return Ok(message);
                     }
