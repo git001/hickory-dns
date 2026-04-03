@@ -10,6 +10,7 @@ use std::marker::Unpin;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(feature = "__quic")]
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 use std::pin::Pin;
 #[cfg(any(feature = "__tls", feature = "__https"))]
 use std::sync::Arc;
@@ -19,12 +20,15 @@ use hickory_net::h2::HttpsClientStream;
 #[cfg(feature = "__tls")]
 use rustls::DigitallySignedStruct;
 #[cfg(feature = "__tls")]
+use rustls::RootCertStore;
+#[cfg(feature = "__tls")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 #[cfg(feature = "__tls")]
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 #[cfg(feature = "__tls")]
+use rustls::pki_types::pem::PemObject;
+#[cfg(feature = "__tls")]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-#[cfg(not(feature = "__tls"))]
 use tracing::warn;
 
 #[cfg(feature = "__h3")]
@@ -226,6 +230,156 @@ impl TlsConfig {
     pub fn insecure_skip_verify(&mut self) {
         warn!("asked to skip TLS verification without TLS support")
     }
+
+    /// Configure additional CA certificates for TLS validation.
+    ///
+    /// Certificates from `ca_file` and `ca_directory` are added to the default root set.
+    #[cfg(feature = "__tls")]
+    pub fn configure_ca(
+        &mut self,
+        ca_file: Option<&Path>,
+        ca_directory: Option<&Path>,
+    ) -> Result<(), NetError> {
+        if ca_file.is_none() && ca_directory.is_none() {
+            return Ok(());
+        }
+
+        let mut root_store = default_root_store();
+        let mut loaded = 0usize;
+
+        if let Some(path) = ca_file {
+            loaded += add_ca_file(path, &mut root_store, true)?;
+        }
+
+        if let Some(path) = ca_directory {
+            loaded += add_ca_directory(path, &mut root_store)?;
+        }
+
+        if loaded == 0 {
+            return Err(NetError::from(
+                "no certificates loaded from tls_ca/tls_ca_directory",
+            ));
+        }
+
+        self.set_root_store(root_store)
+    }
+
+    /// Configure additional CA certificates for TLS validation.
+    #[cfg(not(feature = "__tls"))]
+    pub fn configure_ca(
+        &mut self,
+        ca_file: Option<&Path>,
+        ca_directory: Option<&Path>,
+    ) -> Result<(), NetError> {
+        if ca_file.is_some() || ca_directory.is_some() {
+            warn!(
+                "tls_ca/tls_ca_directory configured but TLS support is not compiled in; CA configuration will be ignored"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "__tls")]
+    fn set_root_store(&mut self, root_store: RootCertStore) -> Result<(), NetError> {
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_safe_default_protocol_versions()?;
+        self.config = builder
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "__tls")]
+fn default_root_store() -> RootCertStore {
+    #[cfg_attr(not(feature = "webpki-roots"), allow(unused_mut))]
+    let mut root_store = RootCertStore::empty();
+    #[cfg(feature = "webpki-roots")]
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    root_store
+}
+
+#[cfg(feature = "__tls")]
+fn add_ca_directory(path: &Path, root_store: &mut RootCertStore) -> Result<usize, NetError> {
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|e| {
+            NetError::from(format!(
+                "failed to read tls_ca_directory {}: {e}",
+                path.display()
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            NetError::from(format!(
+                "failed to read tls_ca_directory {}: {e}",
+                path.display()
+            ))
+        })?;
+    entries.sort_by_key(|entry| entry.path());
+
+    let mut loaded = 0usize;
+    for entry in entries {
+        let file_type = entry.file_type().map_err(|e| {
+            NetError::from(format!(
+                "failed to inspect tls_ca_directory entry {}: {e}",
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        loaded += add_ca_file(&entry.path(), root_store, false)?;
+    }
+
+    Ok(loaded)
+}
+
+#[cfg(feature = "__tls")]
+fn add_ca_file(
+    path: &Path,
+    root_store: &mut RootCertStore,
+    strict: bool,
+) -> Result<usize, NetError> {
+    let certs = match CertificateDer::pem_file_iter(path) {
+        Ok(iter) => iter,
+        Err(error) => {
+            if strict {
+                return Err(NetError::from(format!(
+                    "failed to read tls_ca file {}: {error}",
+                    path.display()
+                )));
+            }
+            warn!(
+                "ignoring non-PEM certificate file in tls_ca_directory {}: {error}",
+                path.display()
+            );
+            return Ok(0);
+        }
+    }
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| {
+        NetError::from(format!(
+            "failed to parse certificate file {}: {error}",
+            path.display()
+        ))
+    })?;
+
+    let (added, _ignored) = root_store.add_parsable_certificates(certs);
+    if added == 0 {
+        if strict {
+            return Err(NetError::from(format!(
+                "no parsable certificates found in tls_ca file {}",
+                path.display()
+            )));
+        }
+        warn!(
+            "ignoring certificate file with no parsable certs in tls_ca_directory {}",
+            path.display()
+        );
+    }
+
+    Ok(added)
 }
 
 /// A rustls ServerCertVerifier that performs **no** certificate verification.
