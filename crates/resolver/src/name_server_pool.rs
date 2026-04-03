@@ -247,6 +247,20 @@ struct PoolState<P: ConnectionProvider> {
     next: AtomicUsize,
 }
 
+/// Sorts servers by their decayed SRTT for query-statistics-based ordering.
+///
+/// Uses `sort_by_cached_key` to evaluate each server's decayed SRTT exactly
+/// once. This is critical because `decayed_srtt()` reads shared mutable state
+/// that can change between calls due to concurrent query completions, which
+/// would violate the total-order invariant required by `sort_by`.
+pub(crate) fn sort_servers_by_query_statistics<P: ConnectionProvider>(
+    servers: &mut [Arc<NameServer<P>>],
+) {
+    // Positive f64 bit patterns sort in the same order as their float values,
+    // so to_bits() is a valid u64 ordering key for non-negative SRTT values.
+    servers.sort_by_cached_key(|s| s.decayed_srtt().to_bits());
+}
+
 impl<P: ConnectionProvider> PoolState<P> {
     async fn try_send(&self, request: DnsRequest) -> Result<DnsResponse, NetError> {
         let mut servers = self.servers.clone();
@@ -291,7 +305,10 @@ impl<P: ConnectionProvider> PoolState<P> {
         let mut backoff = Duration::from_millis(20);
         let mut busy = SmallVec::<[Arc<NameServer<P>>; 2]>::new();
         let mut err = NetError::NoConnections;
-        let mut policy = ConnectionPolicy::default();
+        let mut policy = ConnectionPolicy {
+            prefer_tls: self.cx.options.prefer_tls,
+            ..ConnectionPolicy::default()
+        };
 
         loop {
             // Check the deadline before starting a new round of server attempts.
@@ -395,6 +412,12 @@ impl<P: ConnectionProvider> PoolState<P> {
                         response_code: ResponseCode::NXDomain,
                         ..
                     })) if !server.trust_negative_responses() => {}
+                    // Try other nameservers for transient upstream response codes before
+                    // concluding failure for the whole pool query.
+                    NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
+                    | NetError::Dns(DnsError::ResponseCode(ResponseCode::Refused))
+                    | NetError::Dns(DnsError::ResponseCode(ResponseCode::FormErr))
+                    | NetError::Dns(DnsError::ResponseCode(ResponseCode::NotAuth)) => {}
                     _ => return Err(e),
                 }
 
@@ -431,20 +454,6 @@ fn most_specific(previous: NetError, current: NetError) -> NetError {
     }
 
     previous
-}
-
-/// Sorts servers by their decayed SRTT for query-statistics-based ordering.
-///
-/// Uses `sort_by_cached_key` to evaluate each server's decayed SRTT exactly
-/// once. This is critical because `decayed_srtt()` reads shared mutable state
-/// that can change between calls due to concurrent query completions, which
-/// would violate the total-order invariant required by `sort_by`.
-pub(crate) fn sort_servers_by_query_statistics<P: ConnectionProvider>(
-    servers: &mut [Arc<NameServer<P>>],
-) {
-    // Positive f64 bit patterns sort in the same order as their float values,
-    // so to_bits() is a valid u64 ordering key for non-negative SRTT values.
-    servers.sort_by_cached_key(|s| s.decayed_srtt().to_bits());
 }
 
 /// Context for a [`NameServerPool`]
@@ -676,6 +685,40 @@ impl NameServerTransportState {
         _ip: IpAddr,
         _protocol: Protocol,
         _config: &OpportunisticEncryption,
+    ) -> bool {
+        false
+    }
+
+    /// Returns true if there has been a failed or timed-out connection attempt within the
+    /// given backoff period for the IP/protocol.
+    #[cfg(any(feature = "__tls", feature = "__quic"))]
+    pub(crate) fn has_recent_failure(
+        &self,
+        ip: IpAddr,
+        protocol: Protocol,
+        backoff: Duration,
+    ) -> bool {
+        debug_assert!(protocol.is_encrypted());
+
+        let Some(protocol_state) = self.0.get(&ip) else {
+            return false;
+        };
+
+        match protocol_state.get(protocol) {
+            TransportState::Failed { completed_at } | TransportState::TimedOut { completed_at } => {
+                completed_at.elapsed().unwrap_or(Duration::MAX) <= backoff
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns false when TLS/QUIC is not compiled in.
+    #[cfg(not(any(feature = "__tls", feature = "__quic")))]
+    pub(crate) fn has_recent_failure(
+        &self,
+        _ip: IpAddr,
+        _protocol: Protocol,
+        _backoff: Duration,
     ) -> bool {
         false
     }
