@@ -583,6 +583,16 @@ pub struct ResolverOpts {
     /// This implements the mechanism described in
     /// [draft-vixie-dnsext-dns0x20-00](https://datatracker.ietf.org/doc/html/draft-vixie-dnsext-dns0x20-00).
     pub case_randomization: bool,
+    /// Prefer TLS for upstream connections when available.
+    ///
+    /// If set, encrypted DNS-over-TLS transports are attempted before plaintext UDP/TCP.
+    /// Callers may still fall back to plaintext when TLS connection establishment fails.
+    pub prefer_tls: bool,
+    /// When `prefer_tls` is set, start a fallback plaintext connection after this delay if the
+    /// TLS connection has not yet succeeded (Happy Eyeballs / RFC 8305).
+    /// The first connection to succeed is used; the other is cancelled.
+    /// `None` disables Happy Eyeballs (TLS is tried first, plaintext only on explicit failure).
+    pub happy_eyeballs_delay: Option<Duration>,
     /// Path to a DNSSEC trust anchor file.
     ///
     /// If this is provided, `validate` will automatically be set to `true`, enabling DNSSEC validation.
@@ -641,6 +651,8 @@ impl Default for ResolverOpts {
             avoid_local_udp_ports: Arc::default(),
             os_port_selection: false,
             case_randomization: false,
+            prefer_tls: false,
+            happy_eyeballs_delay: None,
             trust_anchor: None,
             allow_answers: vec![],
             deny_answers: vec![],
@@ -1066,7 +1078,7 @@ pub(crate) mod duration {
 pub(crate) mod duration_opt {
     use std::time::Duration;
 
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserializer, Serialize, Serializer, de};
 
     /// This is an alternate serialization function for an optional [`Duration`] that emits a single
     /// number, representing the number of seconds, instead of a struct with `secs` and `nanos` fields.
@@ -1088,12 +1100,105 @@ pub(crate) mod duration_opt {
         }
     }
 
-    /// This is an alternate deserialization function for an optional [`Duration`] that expects a single
-    /// number, representing the number of seconds, instead of a struct with `secs` and `nanos` fields.
+    /// Parses a duration string with a unit suffix.
+    ///
+    /// Supported formats: `"250ms"`, `"2s"`, `"3m"`, `"1h"`.
+    fn parse_duration_str<E: de::Error>(s: &str) -> Result<Duration, E> {
+        let s = s.trim();
+        if let Some(ms) = s.strip_suffix("ms") {
+            let n: u64 = ms
+                .trim()
+                .parse()
+                .map_err(|_| E::custom(format!("invalid duration: {s:?}")))?;
+            return Ok(Duration::from_millis(n));
+        }
+        let (n_str, mult) = if let Some(h) = s.strip_suffix('h') {
+            (h, 3600u64)
+        } else if let Some(m) = s.strip_suffix('m') {
+            (m, 60u64)
+        } else if let Some(sec) = s.strip_suffix('s') {
+            (sec, 1u64)
+        } else {
+            return Err(E::custom(format!(
+                "invalid duration {s:?}: expected a suffix of ms, s, m, or h"
+            )));
+        };
+        let n: u64 = n_str
+            .trim()
+            .parse()
+            .map_err(|_| E::custom(format!("invalid duration: {s:?}")))?;
+        Ok(Duration::from_secs(n * mult))
+    }
+
+    struct DurationOptVisitor;
+
+    impl<'de> de::Visitor<'de> for DurationOptVisitor {
+        type Value = Option<Duration>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(
+                "null, an integer number of seconds, or a duration string (e.g. \"250ms\", \"2s\", \"1m\", \"1h\")",
+            )
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(DurationOptInnerVisitor).map(Some)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            let secs = u64::try_from(v)
+                .map_err(|_| E::custom(format!("duration must not be negative: {v}")))?;
+            Ok(Some(Duration::from_secs(secs)))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(Duration::from_secs(v)))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            parse_duration_str(v).map(Some)
+        }
+    }
+
+    struct DurationOptInnerVisitor;
+
+    impl<'de> de::Visitor<'de> for DurationOptInnerVisitor {
+        type Value = Duration;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(
+                "an integer number of seconds, or a duration string (e.g. \"250ms\", \"2s\", \"1m\", \"1h\")",
+            )
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            let secs = u64::try_from(v)
+                .map_err(|_| E::custom(format!("duration must not be negative: {v}")))?;
+            Ok(Duration::from_secs(secs))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Duration::from_secs(v))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            parse_duration_str(v)
+        }
+    }
+
+    /// Deserializes an optional [`Duration`] from either `null`, an integer number of seconds,
+    /// or a human-readable string with a unit suffix (`"250ms"`, `"2s"`, `"3m"`, `"1h"`).
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<Duration>, D::Error> {
-        Ok(Option::<u64>::deserialize(deserializer)?.map(Duration::from_secs))
+        deserializer.deserialize_any(DurationOptVisitor)
     }
 }
 
@@ -1127,6 +1232,7 @@ mod tests {
         assert_eq!(code.avoid_local_udp_ports, json.avoid_local_udp_ports);
         assert_eq!(code.os_port_selection, json.os_port_selection);
         assert_eq!(code.case_randomization, json.case_randomization);
+        assert_eq!(code.prefer_tls, json.prefer_tls);
         assert_eq!(code.trust_anchor, json.trust_anchor);
     }
 }
