@@ -220,42 +220,172 @@ impl<P: ConnectionProvider> NameServer<P> {
         }
 
         debug!(config = ?self.config, "connecting");
-        let config = policy
-            .select_connection_config(
+        let transport_state = cx.transport_state().await.clone();
+        let mut configs = self
+            .config
+            .connections
+            .iter()
+            .filter(|config| policy.allows_protocol(config.protocol.to_protocol()))
+            .collect::<Vec<_>>();
+        configs.sort_by(|a, b| {
+            policy.compare_connection_configs(
                 self.config.ip,
-                &*cx.transport_state().await,
+                &transport_state,
                 &cx.opportunistic_encryption,
-                &self.config.connections,
+                a,
+                b,
             )
-            .ok_or(NetError::NoConnections)?;
+        });
 
-        let protocol = config.protocol.to_protocol();
-        if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
-            cx.transport_state()
-                .await
-                .initiate_connection(self.config.ip, protocol);
-        } else if cx.opportunistic_encryption.is_enabled() && !protocol.is_encrypted() {
-            self.consider_probe_encrypted_transport(&policy, cx).await;
+        // Happy Eyeballs: when prefer_tls is set and TLS has no known recent failure,
+        // race the TLS connection against a fallback after `happy_eyeballs_delay`.
+        if let Some(delay) = cx
+            .options
+            .happy_eyeballs_delay
+            .filter(|_| policy.prefer_tls)
+        {
+            let preferred = configs
+                .iter()
+                .find(|c| c.protocol.to_protocol().is_encrypted());
+            let fallback = configs
+                .iter()
+                .find(|c| !c.protocol.to_protocol().is_encrypted());
+            if let (Some(preferred_cfg), Some(fallback_cfg)) = (preferred, fallback) {
+                let tls_protocol = preferred_cfg.protocol.to_protocol();
+                let no_recent_failure = !transport_state.has_recent_failure(
+                    self.config.ip,
+                    tls_protocol,
+                    ConnectionPolicy::PREFER_TLS_FAILURE_BACKOFF,
+                );
+                if no_recent_failure {
+                    match self
+                        .happy_eyeballs(preferred_cfg, fallback_cfg, delay, cx)
+                        .await
+                    {
+                        Ok((handle, protocol)) => {
+                            if protocol.is_encrypted() {
+                                cx.transport_state()
+                                    .await
+                                    .complete_connection(self.config.ip, protocol);
+                            }
+                            let state = ConnectionState::new(handle.clone(), protocol);
+                            let meta = state.meta.clone();
+                            connections.push(state);
+                            return Ok((handle, meta, protocol));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
         }
 
-        let handle = Box::pin(self.connection_provider.new_connection(
-            self.config.ip,
-            config,
-            cx,
-        )?)
-        .await?;
+        let mut last_error = NetError::NoConnections;
+        for config in configs {
+            let protocol = config.protocol.to_protocol();
+            if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
+                cx.transport_state()
+                    .await
+                    .initiate_connection(self.config.ip, protocol);
+            } else if cx.opportunistic_encryption.is_enabled() && !protocol.is_encrypted() {
+                self.consider_probe_encrypted_transport(&policy, cx).await;
+            }
 
-        if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
-            cx.transport_state()
-                .await
-                .complete_connection(self.config.ip, protocol);
+            let handle = match self
+                .connection_provider
+                .new_connection(self.config.ip, config, cx)
+            {
+                Ok(connecting) => Box::pin(connecting).await,
+                Err(error) => Err(error),
+            };
+
+            match handle {
+                Ok(handle) => {
+                    if (cx.opportunistic_encryption.is_enabled() || policy.prefer_tls)
+                        && protocol.is_encrypted()
+                    {
+                        cx.transport_state()
+                            .await
+                            .complete_connection(self.config.ip, protocol);
+                    }
+
+                    // establish a new connection
+                    let state = ConnectionState::new(handle.clone(), protocol);
+                    let meta = state.meta.clone();
+                    connections.push(state);
+                    return Ok((handle, meta, protocol));
+                }
+                Err(error) => {
+                    if (cx.opportunistic_encryption.is_enabled() || policy.prefer_tls)
+                        && protocol.is_encrypted()
+                    {
+                        cx.transport_state()
+                            .await
+                            .error_received(self.config.ip, protocol, &error);
+                    }
+                    last_error = error;
+                }
+            }
         }
 
-        // establish a new connection
-        let state = ConnectionState::new(handle.clone(), protocol);
-        let meta = state.meta.clone();
-        connections.push(state);
-        Ok((handle, meta, protocol))
+        Err(last_error)
+    }
+
+    /// Race a preferred (encrypted) connection against a fallback (plaintext) connection.
+    ///
+    /// The fallback starts only after `delay`. Whichever succeeds first wins; the other
+    /// is cancelled by being dropped. If the preferred connection fails before the delay
+    /// expires, the fallback starts immediately. Returns an error only if both fail.
+    async fn happy_eyeballs(
+        &self,
+        preferred: &ConnectionConfig,
+        fallback: &ConnectionConfig,
+        delay: Duration,
+        cx: &Arc<PoolContext>,
+    ) -> Result<(P::Conn, Protocol), NetError> {
+        let preferred_protocol = preferred.protocol.to_protocol();
+        let fallback_protocol = fallback.protocol.to_protocol();
+        let ip = self.config.ip;
+
+        let connect = |cfg: &ConnectionConfig| {
+            let result = self.connection_provider.new_connection(ip, cfg, cx);
+            async move {
+                match result {
+                    Ok(connecting) => Box::pin(connecting).await,
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        let mut preferred_fut = Box::pin(connect(preferred));
+
+        // Phase 1: give the preferred connection `delay` to succeed on its own.
+        match tokio::time::timeout(delay, &mut preferred_fut).await {
+            Ok(Ok(handle)) => return Ok((handle, preferred_protocol)),
+            Ok(Err(_)) => {
+                // Preferred failed before delay — start fallback immediately.
+                return connect(fallback).await.map(|h| (h, fallback_protocol));
+            }
+            Err(_elapsed) => {
+                // Delay expired, preferred still in progress — race both.
+            }
+        }
+
+        // Phase 2: preferred still running; start fallback and use the first winner.
+        let mut fallback_fut = Box::pin(connect(fallback));
+        tokio::select! {
+            result = &mut preferred_fut => {
+                match result {
+                    Ok(h) => Ok((h, preferred_protocol)),
+                    Err(_) => fallback_fut.await.map(|h| (h, fallback_protocol)),
+                }
+            }
+            result = &mut fallback_fut => {
+                match result {
+                    Ok(h) => Ok((h, fallback_protocol)),
+                    Err(_) => preferred_fut.await.map(|h| (h, preferred_protocol)),
+                }
+            }
+        }
     }
 
     pub(super) fn protocols(&self) -> impl Iterator<Item = Protocol> + '_ {
@@ -723,9 +853,14 @@ impl From<u8> for Status {
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
 pub(crate) struct ConnectionPolicy {
     pub(crate) disable_udp: bool,
+    pub(crate) prefer_tls: bool,
 }
 
 impl ConnectionPolicy {
+    /// How long to deprioritize TLS for a nameserver after a failed connection attempt in
+    /// `prefer_tls` mode. After this period, TLS is tried again.
+    const PREFER_TLS_FAILURE_BACKOFF: Duration = Duration::from_secs(600);
+
     /// Checks if the given server has any protocols compatible with current policy.
     pub(crate) fn allows_server<P: ConnectionProvider>(&self, server: &NameServer<P>) -> bool {
         server.protocols().any(|p| self.allows_protocol(p))
@@ -763,31 +898,6 @@ impl ConnectionPolicy {
         }
     }
 
-    /// Select the best connection configuration to use for a new connection.
-    ///
-    /// This choice is made based on opportunistic encryption policy & probe history,
-    /// and protocol policy.
-    fn select_connection_config<'a>(
-        &self,
-        ip: IpAddr,
-        encrypted_transport_state: &NameServerTransportState,
-        opportunistic_encryption: &OpportunisticEncryption,
-        connection_configs: &'a [ConnectionConfig],
-    ) -> Option<&'a ConnectionConfig> {
-        connection_configs
-            .iter()
-            .filter(|c| self.allows_protocol(c.protocol.to_protocol()))
-            .min_by(|a, b| {
-                self.compare_connection_configs(
-                    ip,
-                    encrypted_transport_state,
-                    opportunistic_encryption,
-                    a,
-                    b,
-                )
-            })
-    }
-
     /// Select the first protocol allowed by current policy that uses an encrypted transport.
     fn select_encrypted_connection_config<'a>(
         &self,
@@ -812,6 +922,14 @@ impl ConnectionPolicy {
         a: &ConnectionState<P>,
         b: &ConnectionState<P>,
     ) -> cmp::Ordering {
+        if self.prefer_tls {
+            match (a.protocol.is_encrypted(), b.protocol.is_encrypted()) {
+                (true, false) => return cmp::Ordering::Less,
+                (false, true) => return cmp::Ordering::Greater,
+                _ => {}
+            }
+        }
+
         // When opportunistic encryption is in-play, we want to consider encrypted
         // connections with the greatest priority.
         if opportunistic_encryption {
@@ -841,6 +959,28 @@ impl ConnectionPolicy {
     ) -> cmp::Ordering {
         let a_protocol = a.protocol.to_protocol();
         let b_protocol = b.protocol.to_protocol();
+
+        if self.prefer_tls {
+            // Prefer TLS, but not if it has recently failed for this nameserver — in that
+            // case fall through so UDP/TCP sort first until the backoff period expires.
+            let a_prefer = a_protocol.is_encrypted()
+                && !encrypted_transport_state.has_recent_failure(
+                    ip,
+                    a_protocol,
+                    Self::PREFER_TLS_FAILURE_BACKOFF,
+                );
+            let b_prefer = b_protocol.is_encrypted()
+                && !encrypted_transport_state.has_recent_failure(
+                    ip,
+                    b_protocol,
+                    Self::PREFER_TLS_FAILURE_BACKOFF,
+                );
+            match (a_prefer, b_prefer) {
+                (true, false) => return cmp::Ordering::Less,
+                (false, true) => return cmp::Ordering::Greater,
+                _ => {}
+            }
+        }
 
         // When opportunistic encryption is in-play, prioritize encrypted protocols
         // that have recent successful connections
@@ -1182,8 +1322,8 @@ mod opportunistic_enc_tests {
     use test_support::{assert_counter_eq, assert_gauge_eq, assert_histogram_sample_count_eq};
 
     use crate::config::{
-        NameServerConfig, OpportunisticEncryption, OpportunisticEncryptionConfig, ProtocolConfig,
-        ResolverOpts,
+        ConnectionConfig, NameServerConfig, OpportunisticEncryption, OpportunisticEncryptionConfig,
+        ProtocolConfig, ResolverOpts,
     };
     use crate::connection_provider::TlsConfig;
     #[cfg(feature = "metrics")]
@@ -1424,6 +1564,31 @@ mod opportunistic_enc_tests {
         let selected = policy.select_connection_config(ns_ip, &state, &opp_enc, &configs);
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, ProtocolConfig::Tcp);
+    }
+
+    #[tokio::test]
+    async fn test_select_connection_config_prefer_tls() {
+        let policy = ConnectionPolicy {
+            prefer_tls: true,
+            ..ConnectionPolicy::default()
+        };
+
+        let ns_ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let configs = vec![
+            ConnectionConfig::udp(),
+            ConnectionConfig::tcp(),
+            ConnectionConfig::tls(Arc::from(ns_ip.to_string())),
+        ];
+
+        let state = NameServerTransportState::default();
+        let opp_enc = OpportunisticEncryption::Disabled;
+
+        let selected = policy.select_connection_config(ns_ip, &state, &opp_enc, &configs);
+        assert!(selected.is_some());
+        assert!(matches!(
+            selected.unwrap().protocol,
+            ProtocolConfig::Tls { .. }
+        ));
     }
 
     #[tokio::test]
