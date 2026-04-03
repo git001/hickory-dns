@@ -9,12 +9,17 @@ use std::{
 };
 
 use async_recursion::async_recursion;
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use futures_util::{StreamExt, stream};
 use lru_cache::LruCache;
 use parking_lot::Mutex;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 
-use super::{DnssecPolicy, RecursorError, RecursorOptions, error::AuthorityData, is_subzone};
+use super::{
+    DnssecPolicy, RecursorError, RecursorOptions, RootZoneDelegation, RootZoneDelegations,
+    error::AuthorityData, is_subzone,
+};
+#[cfg(feature = "__tls")]
+use crate::config::ConnectionConfig;
 #[cfg(feature = "metrics")]
 use crate::metrics::recursor::RecursorMetrics;
 #[cfg(feature = "__dnssec")]
@@ -25,10 +30,10 @@ use crate::{
     connection_provider::{ConnectionProvider, TlsConfig},
     name_server::NameServer,
     name_server_pool::{NameServerPool, NameServerTransportState, PoolContext},
-    net::DnsHandle,
+    net::{DnsHandle, NetError},
     proto::{
         access_control::{AccessControlSet, AccessControlSetBuilder},
-        op::{DnsRequestOptions, Message, Query},
+        op::{DnsRequestOptions, DnsResponse, Message, Query},
         rr::{
             Name, RData,
             RData::CNAME,
@@ -42,15 +47,18 @@ use crate::{
 pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     roots: NameServerPool<P>,
     name_server_cache: Arc<Mutex<LruCache<Name, NameServerPool<P>>>>,
+    local_root_delegations: Arc<HashMap<Name, RootZoneDelegation>>,
     response_cache: ResponseCache,
     #[cfg(feature = "metrics")]
     pub(super) metrics: RecursorMetrics,
     recursion_limit: u8,
     ns_recursion_limit: u8,
+    prefer_tls_min_depth: Option<u8>,
     name_server_filter: AccessControlSet,
     pool_context: Arc<PoolContext>,
     conn_provider: P,
     connection_cache: Arc<Mutex<LruCache<IpAddr, Arc<NameServer<P>>>>>,
+    transient_ns_error_cache: Arc<Mutex<LruCache<Query, Instant>>>,
     request_options: DnsRequestOptions,
     ttl_config: TtlConfig,
 }
@@ -63,12 +71,24 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         options: RecursorOptions,
         tls: TlsConfig,
         conn_provider: P,
+        local_root_delegations: RootZoneDelegations,
     ) -> Result<Self, RecursorError> {
         assert!(!roots.is_empty(), "roots must not be empty");
         let servers = roots
             .iter()
             .copied()
-            .map(|ip| name_server_config(ip, &options.opportunistic_encryption))
+            .map(|ip| {
+                name_server_config(
+                    ip,
+                    None,
+                    &options.opportunistic_encryption,
+                    effective_prefer_tls(
+                        options.prefer_tls,
+                        options.prefer_tls_min_depth,
+                        &Name::root(),
+                    ),
+                )
+            })
             .collect::<Vec<_>>();
 
         let RecursorOptions {
@@ -83,6 +103,15 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             avoid_local_udp_ports,
             cache_policy,
             case_randomization,
+            num_concurrent_reqs,
+            connection_timeout,
+            happy_eyeballs_delay,
+            transport_encryption: _,
+            prefer_tls,
+            prefer_tls_min_depth,
+            insecure: _,
+            tls_ca: _,
+            tls_ca_directory: _,
             opportunistic_encryption,
             edns_payload_len,
         } = options;
@@ -99,6 +128,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 avoid_local_udp_ports.clone(),
                 case_randomization,
                 edns_payload_len,
+                num_concurrent_reqs,
+                prefer_tls,
+                connection_timeout,
+                happy_eyeballs_delay,
             ),
             tls,
         )
@@ -137,11 +170,13 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         Ok(Self {
             roots,
             name_server_cache,
+            local_root_delegations: Arc::new(local_root_delegations.zones),
             response_cache,
             #[cfg(feature = "metrics")]
             metrics: RecursorMetrics::new(),
             recursion_limit,
             ns_recursion_limit,
+            prefer_tls_min_depth,
             name_server_filter: AccessControlSetBuilder::new("name_servers")
                 .allow(allow_server.iter())
                 .deny(deny_server.iter())
@@ -149,9 +184,18 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             pool_context,
             conn_provider,
             connection_cache: Arc::new(Mutex::new(LruCache::new(ns_cache_size))),
+            transient_ns_error_cache: Arc::new(Mutex::new(LruCache::new(ns_cache_size))),
             request_options,
             ttl_config: cache_policy.clone(),
         })
+    }
+
+    fn effective_prefer_tls(&self, zone: &Name) -> bool {
+        effective_prefer_tls(
+            self.pool_context.options.prefer_tls,
+            self.prefer_tls_min_depth,
+            zone,
+        )
     }
 
     pub(crate) async fn resolve(
@@ -433,7 +477,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         let mut response = match response.next().await {
             Some(Ok(r)) => r,
             Some(Err(error)) => {
-                warn!(?query, %error, "lookup error");
+                debug!(?query, %error, "lookup error");
                 self.response_cache.insert(query, Err(error.clone()), now);
                 return Err(RecursorError::from(error));
             }
@@ -445,7 +489,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         let answer_filter = |record: &Record| {
             if !is_subzone(&zone, &record.name) {
-                error!(
+                debug!(
                     %record, %zone,
                     "dropping out of bailiwick record",
                 );
@@ -510,11 +554,56 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 }
             };
 
+            let parent_zone = zone.base_name();
+            let (positive_min_ttl, positive_max_ttl) = self
+                .ttl_config
+                .positive_response_ttl_bounds(RecordType::NS)
+                .into_inner();
+
+            if parent_zone.is_root() {
+                if let Some(RootZoneDelegation { ips, ttl }) =
+                    self.local_root_delegations.get(&zone)
+                {
+                    let mut config_group = Vec::new();
+                    for ip in ips.iter().copied() {
+                        if self.name_server_filter.denied(ip) {
+                            debug!(
+                                %ip,
+                                "ignoring local root delegation address due to do_not_query"
+                            );
+                            continue;
+                        }
+
+                        config_group.push(name_server_config(
+                            ip,
+                            None,
+                            &self.pool_context.opportunistic_encryption,
+                            self.effective_prefer_tls(&zone),
+                        ));
+                    }
+
+                    if !config_group.is_empty() {
+                        let servers = self.name_servers_from_configs(&config_group);
+                        let ns_pool_ttl = Duration::from_secs(*ttl as u64)
+                            .clamp(positive_min_ttl, positive_max_ttl);
+
+                        nameserver_pool =
+                            NameServerPool::from_nameservers(servers, self.pool_context.clone())
+                                .with_ttl(ns_pool_ttl)
+                                .with_zone(zone.clone());
+
+                        debug!(?zone, "using local root-zone delegation");
+                        self.name_server_cache
+                            .lock()
+                            .insert(zone.clone(), nameserver_pool.clone());
+                        continue;
+                    }
+                }
+            }
+
             trace!(depth, ?zone, "ns_pool_for_name: depth {depth} for {zone}");
             depth += 1;
             RecursorError::recursion_exceeded(self.ns_recursion_limit, depth, &zone)?;
-
-            let parent_zone = zone.base_name();
 
             let query = Query::query(zone.clone(), RecordType::NS);
 
@@ -547,25 +636,11 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 }
             };
 
-            let any_ns = response
-                .all_sections()
-                .any(|record| record.record_type() == RecordType::NS && record.name == zone);
-            if !any_ns {
-                // Not a zone cut, but there is a CNAME or other record at this name. Return the
-                // same pool of name servers as above in the error case, to try again with a
-                // longer name.
-                trace!(?zone, "no zone cut at zone");
-                continue;
-            }
-
             // get all the NS records and glue
             let mut config_group = Vec::new();
             let mut need_ips_for_names = Vec::new();
             let mut glue_ips = HashMap::new();
-            let (positive_min_ttl, positive_max_ttl) = self
-                .ttl_config
-                .positive_response_ttl_bounds(RecordType::NS)
-                .into_inner();
+            let mut has_zone_cut = false;
             let mut ns_pool_ttl = u32::MAX;
 
             let ttl = self.add_glue_to_map(&mut glue_ips, response.all_sections());
@@ -574,13 +649,23 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 ns_pool_ttl = ttl;
             }
 
-            for zns in response.all_sections() {
+            for zns in response.answers.iter().chain(response.authorities.iter()) {
                 let RData::NS(ns_data) = &zns.data else {
                     continue;
                 };
 
+                if &zns.name != &zone {
+                    trace!(
+                        zone = %zone,
+                        delegation_owner = %zns.name,
+                        "ignoring NS RRset that does not match current zone-cut candidate"
+                    );
+                    continue;
+                }
+                has_zone_cut = true;
+
                 if !is_subzone(&zone.base_name(), &zns.name) {
-                    warn!(
+                    debug!(
                         name = ?zns.name,
                         parent = ?zone.base_name(),
                         "dropping out of bailiwick record",
@@ -607,7 +692,12 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 match glue_ips.get(&ns_data.0) {
                     Some(glue) if !glue.is_empty() => {
                         config_group.extend(glue.iter().copied().map(|ip| {
-                            name_server_config(ip, &self.pool_context.opportunistic_encryption)
+                            name_server_config(
+                                ip,
+                                Some(&ns_data.0),
+                                &self.pool_context.opportunistic_encryption,
+                                self.effective_prefer_tls(&zone),
+                            )
                         }));
                     }
                     _ => {
@@ -615,6 +705,13 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                         need_ips_for_names.push(ns_data.to_owned());
                     }
                 }
+            }
+
+            if !has_zone_cut {
+                // Not a zone cut at this exact name. Keep the current pool and continue with
+                // the next longer candidate zone.
+                trace!(?zone, "no zone cut at zone");
+                continue;
             }
 
             // If we have no glue, collect missing nameserver IP addresses.
@@ -641,27 +738,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 }
             }
 
-            let servers = {
-                let mut cache = self.connection_cache.lock();
-                config_group
-                    .iter()
-                    .map(|server| {
-                        if let Some(ns) = cache.get_mut(&server.ip) {
-                            return ns.clone();
-                        }
-
-                        debug!(?server, "adding new name server to cache");
-                        let ns = Arc::new(NameServer::new(
-                            [],
-                            server.clone(),
-                            &self.pool_context.options,
-                            self.conn_provider.clone(),
-                        ));
-                        cache.insert(server.ip, ns.clone());
-                        ns
-                    })
-                    .collect()
-            };
+            let servers = self.name_servers_from_configs(&config_group);
 
             let ns_pool_ttl =
                 Duration::from_secs(ns_pool_ttl as u64).clamp(positive_min_ttl, positive_max_ttl);
@@ -737,56 +814,107 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         config: &mut Vec<NameServerConfig>,
     ) -> Result<(u32, u8), RecursorError> {
         let mut pool_queries = vec![];
+        let mut last_error: Option<RecursorError> = None;
+        let nameservers = nameservers.map(|ns| ns.0.clone()).collect::<Vec<_>>();
+        let num_concurrent_reqs = self.pool_context.options.num_concurrent_reqs;
 
-        for ns in nameservers {
-            let record_name = ns.0.clone();
+        let mut ns_pool_lookups = stream::iter(nameservers.into_iter().map(|record_name| {
+            let zone = zone.clone();
+            let nameserver_pool = nameserver_pool.clone();
+            async move {
+                if is_subzone(&zone, &record_name) {
+                    return (record_name, None, Ok(Some(nameserver_pool)));
+                }
 
-            // For child nameservers of zone, we can reuse the pool that was passed in as
-            // nameserver_pool, but for a non-child nameservers we need to get an appropriate pool.
-            // To avoid incrementing the depth counter for each nameserver, we'll use the passed in
-            // depth as a fixed base for the nameserver lookups
-            let nameserver_pool = if !is_subzone(zone, &record_name) {
-                match self
+                // For non-child nameservers, find a pool for the nameserver's own zone. Skip
+                // repeated transient failures for the configured negative TTL window.
+                let ns_query = Query::query(record_name.clone(), RecordType::NS);
+                if self.transient_ns_error_cached(&ns_query, request_time) {
+                    return (record_name, Some(ns_query), Ok(None));
+                }
+
+                let result = self
                     .ns_pool_for_name(record_name.clone(), request_time, depth)
                     .await
-                {
-                    Ok((_, pool)) => pool.with_zone(zone.clone()),
-                    // The NS hostname could not be resolved. This doesn't mean the
-                    // original queried domain doesn't exist, only that this nameserver
-                    // is unreachable. Skip it and try others. If they all fail, the
-                    // empty pool will result in SERVFAIL.
-                    Err(error) => {
-                        debug!(?record_name, ?error, "nameserver hostname lookup failure");
-                        continue;
+                    .map(|(_, pool)| Some(pool.with_zone(zone)))
+                    .inspect_err(|e| {
+                        if Self::is_transient_recursor_error(e) {
+                            self.cache_transient_ns_error(ns_query.clone(), request_time);
+                        }
+                    });
+
+                (record_name, Some(ns_query), result)
+            }
+        }))
+        .buffer_unordered(num_concurrent_reqs);
+
+        while let Some((record_name, ns_query, result)) = ns_pool_lookups.next().await {
+            match result {
+                Ok(Some(pool)) => {
+                    if let Some(query) = ns_query.as_ref() {
+                        self.clear_transient_ns_error(query);
                     }
+                    pool_queries.push((pool, record_name));
                 }
-            } else {
-                nameserver_pool.clone()
-            };
-
-            pool_queries.push((nameserver_pool, record_name));
-        }
-
-        let mut futures = FuturesUnordered::new();
-
-        for (pool, query) in pool_queries.iter() {
-            for rec_type in [RecordType::A, RecordType::AAAA] {
-                futures.push(Box::pin(
-                    pool.lookup(Query::query(query.clone(), rec_type), self.request_options)
-                        .into_future()
-                        .map(|(first, _rest)| first),
-                ));
+                Ok(None) => {
+                    debug!(
+                        name_server = %record_name,
+                        "skipping nameserver due to cached transient lookup failure"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        name_server = %record_name,
+                        %error,
+                        "append_ips_from_lookup: nameserver pool resolution failed"
+                    );
+                    last_error = Some(error);
+                }
             }
         }
 
+        let mut lookup_queries = Vec::new();
+        for (pool, query_name) in pool_queries {
+            for record_type in [RecordType::A, RecordType::AAAA] {
+                lookup_queries.push((pool.clone(), Query::query(query_name.clone(), record_type)));
+            }
+        }
+
+        let mut futures = stream::iter(lookup_queries.into_iter())
+            .map(|(pool, query)| async move {
+                if self.transient_ns_error_cached(&query, request_time) {
+                    return (query, Ok::<Option<DnsResponse>, NetError>(None));
+                }
+
+                let (response, _rest) = pool
+                    .lookup(query.clone(), self.request_options)
+                    .into_future()
+                    .await;
+                let response = match response {
+                    Some(Ok(response)) => Ok(Some(response)),
+                    Some(Err(error)) => Err(error),
+                    None => Err(NetError::from("no response to lookup")),
+                };
+
+                (query, response)
+            })
+            .buffer_unordered(num_concurrent_reqs);
+
         let mut ttl = u32::MAX;
 
-        while let Some(next) = futures.next().await {
+        while let Some((query, next)) = futures.next().await {
             match next {
-                Some(Ok(response)) => {
+                Ok(Some(response)) => {
+                    self.clear_transient_ns_error(&query);
                     debug!("append_ips_from_lookup: A or AAAA response: {response:?}");
-                    config.extend(response.into_message()
-                        .answers
+                    let ns_name = query.name().clone();
+                    let msg = response.into_message();
+                    self.response_cache.insert(
+                        query,
+                        Ok(msg.clone()),
+                        request_time,
+                    );
+                    config.extend(msg.answers
                         .into_iter()
                         .filter_map(|answer| {
                             let ip = answer.data.ip_addr()?;
@@ -800,18 +928,115 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                                 }
                                 Some(ip)
                             }
-                        }).map(|ip| name_server_config(ip, &self.pool_context.opportunistic_encryption)));
+                        })
+                        .map(|ip| {
+                            name_server_config(
+                                ip,
+                                Some(&ns_name),
+                                &self.pool_context.opportunistic_encryption,
+                                self.effective_prefer_tls(zone),
+                            )
+                        }));
                 }
-                Some(Err(e)) => {
+                Ok(None) => {
+                    debug!(%query, "append_ips_from_lookup: skipping cached transient error");
+                }
+                Err(e) => {
+                    if matches!(e, NetError::Dns(crate::net::DnsError::NoRecordsFound(_)))
+                        && matches!(query.query_type(), RecordType::A | RecordType::AAAA)
+                    {
+                        debug!(
+                            %query,
+                            "append_ips_from_lookup: no A/AAAA records for nameserver name"
+                        );
+                        continue;
+                    }
+
+                    if Self::is_transient_net_error(&e) {
+                        self.cache_transient_ns_error(query, request_time);
+                    }
+                    let error = RecursorError::from(e.clone());
+                    last_error = Some(error);
                     warn!("append_ips_from_lookup: resolution failed failed: {e}");
-                }
-                None => {
-                    warn!("no response to lookup");
                 }
             }
         }
 
+        if config.is_empty() {
+            return Err(last_error.unwrap_or_else(|| {
+                RecursorError::from("failed to resolve address records for delegated nameservers")
+            }));
+        }
+
         Ok((ttl, depth))
+    }
+
+    fn transient_ns_error_cached(&self, query: &Query, now: Instant) -> bool {
+        let mut cache = self.transient_ns_error_cache.lock();
+        match cache.get_mut(query) {
+            Some(valid_until) if *valid_until > now => true,
+            Some(_) => {
+                cache.remove(query);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn clear_transient_ns_error(&self, query: &Query) {
+        self.transient_ns_error_cache.lock().remove(query);
+    }
+
+    fn cache_transient_ns_error(&self, query: Query, now: Instant) {
+        let (negative_min_ttl, _) = self
+            .ttl_config
+            .negative_response_ttl_bounds(RecordType::NS)
+            .into_inner();
+        let ttl = negative_min_ttl.max(Duration::from_secs(1));
+
+        self.transient_ns_error_cache
+            .lock()
+            .insert(query, now + ttl);
+    }
+
+    fn is_transient_recursor_error(error: &RecursorError) -> bool {
+        match error {
+            RecursorError::Timeout => true,
+            RecursorError::Net(net) => Self::is_transient_net_error(net),
+            _ => false,
+        }
+    }
+
+    fn is_transient_net_error(error: &NetError) -> bool {
+        matches!(
+            error,
+            NetError::Timeout | NetError::NoConnections | NetError::Busy | NetError::Io(_)
+        )
+    }
+
+    fn name_servers_from_configs(
+        &self,
+        config_group: &[NameServerConfig],
+    ) -> Vec<Arc<NameServer<P>>> {
+        let mut cache = self.connection_cache.lock();
+        config_group
+            .iter()
+            .map(|server| {
+                if let Some(ns) = cache.get_mut(&server.ip) {
+                    return ns.clone();
+                }
+
+                debug!(?server, "adding new name server to cache");
+                let ns = Arc::new(NameServer::new(
+                    [],
+                    server.clone(),
+                    &self.pool_context.clone().options,
+                    self.conn_provider.clone(),
+                ));
+                cache.insert(server.ip, ns.clone());
+                ns
+            })
+            .collect()
     }
 }
 
@@ -878,7 +1103,12 @@ fn recursor_opts(
     avoid_local_udp_ports: Arc<HashSet<u16>>,
     case_randomization: bool,
     edns_payload_len: u16,
+    num_concurrent_reqs: usize,
+    prefer_tls: bool,
+    connection_timeout: Option<Duration>,
+    happy_eyeballs_delay: Option<Duration>,
 ) -> ResolverOpts {
+    let default = ResolverOpts::default();
     ResolverOpts {
         ndots: 0,
         edns0: true,
@@ -886,18 +1116,43 @@ fn recursor_opts(
         validate: false, // we'll need to do any dnssec validation differently in a recursor (top-down rather than bottom-up)
         preserve_intermediates: true,
         recursion_desired: false,
-        num_concurrent_reqs: 1,
+        num_concurrent_reqs: Ord::max(num_concurrent_reqs, 1),
         avoid_local_udp_ports,
         case_randomization,
         edns_payload_len,
-        ..ResolverOpts::default()
+        prefer_tls,
+        timeout: connection_timeout.unwrap_or(default.timeout),
+        happy_eyeballs_delay,
+        ..default
     }
 }
 
 fn name_server_config(
     ip: IpAddr,
+    ns_name: Option<&Name>,
     opportunistic_encryption: &OpportunisticEncryption,
+    prefer_tls: bool,
 ) -> NameServerConfig {
+    #[cfg(feature = "__tls")]
+    if prefer_tls {
+        let server_name = tls_server_name(ip, ns_name);
+        return NameServerConfig::new(
+            ip,
+            true,
+            vec![
+                ConnectionConfig::tls(server_name),
+                ConnectionConfig::udp(),
+                ConnectionConfig::tcp(),
+            ],
+        );
+    }
+
+    #[cfg(not(feature = "__tls"))]
+    {
+        let _ = prefer_tls;
+        let _ = ns_name;
+    }
+
     match opportunistic_encryption {
         #[cfg(any(
             feature = "tls-aws-lc-rs",
@@ -910,6 +1165,31 @@ fn name_server_config(
     }
 }
 
+#[cfg(feature = "__tls")]
+fn tls_server_name(ip: IpAddr, ns_name: Option<&Name>) -> Arc<str> {
+    if let Some(name) = ns_name {
+        let fqdn = name.to_ascii();
+        if let Some(stripped) = fqdn.strip_suffix('.') {
+            if !stripped.is_empty() {
+                return Arc::from(stripped);
+            }
+        }
+    }
+
+    Arc::from(ip.to_string())
+}
+
+/// Returns whether TLS should be preferred for a nameserver at the given zone.
+///
+/// When `min_depth` is set, TLS is preferred only for zones with at least that many labels
+/// (e.g. `min_depth = 2` skips TLS for root `.` and TLD `com.` servers).
+fn effective_prefer_tls(prefer_tls: bool, min_depth: Option<u8>, zone: &Name) -> bool {
+    if !prefer_tls {
+        return false;
+    }
+    min_depth.is_none_or(|min| zone.num_labels() >= min)
+}
+
 /// Maximum number of cname records to look up in a CNAME chain, regardless of the recursion
 /// depth limit
 const MAX_CNAME_LOOKUPS: u8 = 64;
@@ -918,6 +1198,8 @@ const MAX_CNAME_LOOKUPS: u8 = 64;
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
+    #[cfg(feature = "__tls")]
+    use crate::proto::rr::Name;
     use ipnet::IpNet;
 
     use crate::{
@@ -966,5 +1248,20 @@ mod tests {
         for addr in [[128, 0, 0, 0], [192, 168, 2, 0], [192, 168, 0, 1]] {
             assert!(!handle.name_server_filter.denied(IpAddr::from(addr)));
         }
+    }
+
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn test_tls_server_name_prefers_ns_name() {
+        let ns_name = Name::from_ascii("ns1.example.com.").expect("valid DNS name");
+        let server_name = super::tls_server_name(IpAddr::from([192, 0, 2, 1]), Some(&ns_name));
+        assert_eq!(&*server_name, "ns1.example.com");
+    }
+
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn test_tls_server_name_falls_back_to_ip() {
+        let server_name = super::tls_server_name(IpAddr::from([192, 0, 2, 1]), None);
+        assert_eq!(&*server_name, "192.0.2.1");
     }
 }
