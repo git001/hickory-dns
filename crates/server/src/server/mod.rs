@@ -93,6 +93,8 @@ impl<T: RequestHandler> Server<T> {
                 handler,
                 access,
                 shutdown: CancellationToken::new(),
+                #[cfg(feature = "metrics")]
+                metrics: ResponseHandlerMetrics::default(),
             }),
             join_set: JoinSet::new(),
         }
@@ -740,6 +742,8 @@ struct ServerContext<T> {
     handler: T,
     access: AccessControl,
     shutdown: CancellationToken,
+    #[cfg(feature = "metrics")]
+    metrics: ResponseHandlerMetrics,
 }
 
 impl<T: RequestHandler> ServerContext<T> {
@@ -791,6 +795,8 @@ impl<T: RequestHandler> ServerContext<T> {
                 ResponseCode::Refused,
                 "request refused",
                 response_handler,
+                #[cfg(feature = "metrics")]
+                self.metrics.clone(),
             )
             .await;
 
@@ -817,6 +823,8 @@ impl<T: RequestHandler> ServerContext<T> {
                     ResponseCode::FormErr,
                     error,
                     response_handler,
+                    #[cfg(feature = "metrics")]
+                    self.metrics.clone(),
                 )
                 .await;
 
@@ -868,7 +876,7 @@ impl<T: RequestHandler> ServerContext<T> {
             src_addr: request.src(),
             handler: response_handler,
             #[cfg(feature = "metrics")]
-            metrics: ResponseHandlerMetrics::default(),
+            metrics: self.metrics.clone(),
         };
 
         self.handler
@@ -886,6 +894,7 @@ async fn error_response_handler(
     response_code: ResponseCode,
     error: impl fmt::Display,
     response_handler: impl ResponseHandler,
+    #[cfg(feature = "metrics")] metrics: ResponseHandlerMetrics,
 ) {
     // debug for more info on why the message parsing failed
     debug!(
@@ -908,7 +917,7 @@ async fn error_response_handler(
         src_addr,
         handler: response_handler,
         #[cfg(feature = "metrics")]
-        metrics: ResponseHandlerMetrics::default(),
+        metrics,
     };
 
     let response = MessageResponseBuilder::new(&queries, None);
