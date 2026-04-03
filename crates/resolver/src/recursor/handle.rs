@@ -906,11 +906,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     debug!("append_ips_from_lookup: A or AAAA response: {response:?}");
                     let ns_name = query.name().clone();
                     let msg = response.into_message();
-                    self.response_cache.insert(
-                        query,
-                        Ok(msg.clone()),
-                        request_time,
-                    );
+                    self.response_cache
+                        .insert(query, Ok(msg.clone()), request_time);
                     config.extend(msg.answers
                         .into_iter()
                         .filter_map(|answer| {

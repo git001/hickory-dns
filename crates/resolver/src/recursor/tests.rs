@@ -121,12 +121,12 @@ async fn signed_root_zone_bootstrap_avoids_root_queries() -> Result<(), Box<dyn 
         )
         .await?;
 
-    assert_eq!(response.response_code(), ResponseCode::NoError);
+    assert_eq!(response.response_code, ResponseCode::NoError);
     assert!(
         response
-            .answers()
+            .answers
             .iter()
-            .any(|answer| answer.record_type() == RecordType::A && answer.name() == &query_name)
+            .any(|answer: &Record| answer.record_type() == RecordType::A && answer.name() == &query_name)
     );
 
     // The TLD delegation is sourced from the local root zone file.

@@ -1149,7 +1149,9 @@ pub(crate) mod duration_opt {
             self,
             deserializer: D,
         ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_any(DurationOptInnerVisitor).map(Some)
+            deserializer
+                .deserialize_any(DurationOptInnerVisitor)
+                .map(Some)
         }
 
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
