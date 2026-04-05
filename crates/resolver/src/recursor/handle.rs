@@ -652,7 +652,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     continue;
                 };
 
-                if &zns.name != &zone {
+                if zns.name != zone {
                     trace!(
                         zone = %zone,
                         delegation_owner = %zns.name,

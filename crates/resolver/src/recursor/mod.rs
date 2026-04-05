@@ -543,34 +543,34 @@ fn extract_root_hints_and_delegations(
         .values()
         .flat_map(RecordSet::records_without_rrsigs)
     {
-        match record.data() {
+        match &record.data {
             RData::A(ip) => {
-                let entry = ips_by_name.entry(record.name().clone()).or_default();
+                let entry = ips_by_name.entry(record.name.clone()).or_default();
                 let ip = IpAddr::from(ip.0);
                 if !entry.contains(&ip) {
                     entry.push(ip);
                 }
             }
             RData::AAAA(ip) => {
-                let entry = ips_by_name.entry(record.name().clone()).or_default();
+                let entry = ips_by_name.entry(record.name.clone()).or_default();
                 let ip = IpAddr::from(ip.0);
                 if !entry.contains(&ip) {
                     entry.push(ip);
                 }
             }
-            RData::NS(ns) if record.name().is_root() => {
+            RData::NS(ns) if record.name.is_root() => {
                 if !root_ns_names.contains(&ns.0) {
                     root_ns_names.push(ns.0.clone());
                 }
             }
             RData::NS(ns) => {
                 let entry = delegations
-                    .entry(record.name().clone())
+                    .entry(record.name.clone())
                     .or_insert_with(|| (Vec::new(), u32::MAX));
                 if !entry.0.contains(&ns.0) {
                     entry.0.push(ns.0.clone());
                 }
-                entry.1 = entry.1.min(record.ttl());
+                entry.1 = entry.1.min(record.ttl);
             }
             _ => {}
         }
